@@ -20,6 +20,53 @@ This app shows three approaches side by side so the difference is obvious in a d
 > The UI is themed as a fictional "Contoso Analytics Portal" so it reads as a
 > customer app, not a Databricks page.
 
+## Architecture
+
+```mermaid
+flowchart LR
+    subgraph browser["User's browser"]
+        portal["Host app page<br/>(Contoso portal)"]
+        iframe["Genie iframe<br/>/embed/genie/rooms/…"]
+    end
+
+    subgraph app["Your app — FastAPI (single worker)"]
+        login["/dbx-login<br/>PKCE + state"]
+        cb["/callback2<br/>token exchange + SCIM /Me"]
+        pkce[("in-process<br/>PKCE store")]
+        login --- pkce
+        cb --- pkce
+    end
+
+    subgraph dbx["Databricks workspace"]
+        aad["/aad/auth<br/>(sets session cookie)"]
+        oidc["/oidc/v1/authorize<br/>/oidc/v1/token"]
+        scim["/scim/v2/Me"]
+        genie["Genie Space<br/>(embed surface)"]
+    end
+
+    entra["Microsoft Entra<br/>(the one sign-in)"]
+    reg["Databricks custom<br/>OAuth app integration"]:::note
+
+    portal -->|"Sign in once"| login
+    login -->|302| aad
+    aad --> entra
+    entra --> aad
+    aad --> oidc
+    oidc -->|"302 code+state"| cb
+    cb -->|client_secret + PKCE| oidc
+    cb --> scim
+    iframe -->|rides workspace session cookie| genie
+    reg -.->|"DBX_CLIENT_ID / SECRET<br/>enables top-level chain"| login
+
+    classDef note fill:#fff4e6,stroke:#c97a1c,color:#8a4b2a;
+```
+
+The **OAuth app integration** (dashed) is registration, not a runtime hop — but it's the
+enabling piece: without it the whole top-level redirect chain can't exist, and you fall
+back to a popup. Everything the browser sees happens as one chain of top-level 302s; the
+iframe never carries the auth itself, it just reuses the workspace session cookie planted
+along the way.
+
 ---
 
 ## How the zero-popup flow works (`/v0`)
@@ -31,25 +78,33 @@ Databricks workspace, a single top-level OAuth redirect chain both authenticates
 native Genie iframe loads directly against that already-established session — no popup, no
 second prompt.
 
-```
-Browser                     Your app                 Databricks workspace         Entra
-   │  click "Sign in once"      │                            │                       │
-   │ ─────────────────────────► │ GET /dbx-login             │                       │
-   │                            │  build PKCE + state        │                       │
-   │  302 to workspace /aad/auth?next_url=b64(/oidc/v1/authorize?…)                   │
-   │ ◄───────────────────────── │                            │                       │
-   │ ──────────────────────────────────────────────────────► │                       │
-   │                            │            302 to Entra ──────────────────────────►│
-   │                            │                            │   ◄─ THE ONE SIGN-IN ─│
-   │                            │            ◄── redirect back, workspace session ────│
-   │                            │                            │  cookie set here ◄─┐   │
-   │                            │  /oidc/v1/authorize issues an auth code         │   │
-   │  302 back to app /callback2 (code + state) ◄─────────────┘                   │   │
-   │ ─────────────────────────► │ GET /callback2             │                       │
-   │                            │  POST /oidc/v1/token       │                       │
-   │                            │  (client_secret + PKCE) ─► exchange code → token    │
-   │                            │  GET /scim/v2/Me ─────────► resolve identity        │
-   │  302 to /v0, iframe loads against the live workspace session (no popup) ◄──── │  │
+```mermaid
+sequenceDiagram
+    autonumber
+    actor U as Browser (user)
+    participant A as Your app<br/>(FastAPI)
+    participant W as Databricks<br/>workspace
+    participant E as Microsoft<br/>Entra
+
+    U->>A: click "Sign in once" → GET /dbx-login
+    Note over A: build PKCE verifier/challenge + state
+    A-->>U: 302 → /aad/auth?next_url=b64(/oidc/v1/authorize?…)
+    U->>W: follow redirect to /aad/auth
+    W-->>U: 302 → Entra
+    U->>E: authenticate
+    Note over U,E: THE ONE SIGN-IN<br/>(silent if a session exists)
+    E-->>U: redirect back to workspace
+    Note over W: workspace session cookie<br/>set as a side effect
+    W->>W: /oidc/v1/authorize issues auth code
+    W-->>U: 302 → app /callback2 (code + state)
+    U->>A: GET /callback2
+    A->>W: POST /oidc/v1/token (client_secret + PKCE verifier)
+    W-->>A: access token
+    A->>W: GET /scim/v2/Me (identity)
+    W-->>A: userName / email
+    A-->>U: 302 → /v0, set signed dbx_session cookie
+    U->>W: Genie iframe loads on the live workspace session
+    Note over U,W: no popup, no second prompt
 ```
 
 ### The components that make it work
