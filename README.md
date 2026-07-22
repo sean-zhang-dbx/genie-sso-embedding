@@ -9,13 +9,9 @@ inside an iframe (`X-Frame-Options: DENY`, even with third-party cookies enabled
 naive result is a *double login* — the user signs into your app, then Databricks prompts
 them again inside the frame.
 
-This app shows three approaches side by side so the difference is obvious in a demo:
-
-| Route | Name | Experience |
-|-------|------|------------|
-| `/v0` | **Zero-friction SSO** | One sign-in, one top-level redirect chain, then the Genie iframe just loads. **This is the fix.** |
-| `/v2` | Popup bootstrap | A brief self-closing popup mints the Databricks session top-level, then the iframe loads. The best you can do *without* OAuth registration. |
-| `/v3` | Current experience | The iframe triggers the Databricks sign-in in-frame — the double login customers complain about today. |
+This app implements the fix as a single flow: the user clicks **Sign in once**, one
+top-level redirect chain authenticates them *and* establishes the Databricks session,
+then the native Genie iframe just loads — no popup, no second prompt.
 
 > The UI is themed as a fictional "Contoso Analytics Portal" so it reads as a
 > customer app, not a Databricks page.
@@ -69,7 +65,7 @@ along the way.
 
 ---
 
-## How the zero-popup flow works (`/v0`)
+## How the zero-popup flow works
 
 The key insight: **register the external app as a Databricks custom OAuth app
 integration** on the account. Because the app is now a first-class OAuth client of the
@@ -102,7 +98,7 @@ sequenceDiagram
     W-->>A: access token
     A->>W: GET /scim/v2/Me (identity)
     W-->>A: userName / email
-    A-->>U: 302 → /v0, set signed dbx_session cookie
+    A-->>U: 302 → /, set signed dbx_session cookie
     U->>W: Genie iframe loads on the live workspace session
     Note over U,W: no popup, no second prompt
 ```
@@ -184,7 +180,7 @@ across the `/dbx-login` → `/callback2` round trip. Set the `.env` values as Ap
 application settings.
 
 Health check: `GET /healthz` → `{"ok": true, "sso_enabled": true|false}`. If
-`sso_enabled` is `false`, one or more `SSO_*` / `DBX_*` variables are missing and `/v0`
+`sso_enabled` is `false`, one or more `SSO_*` / `DBX_*` variables are missing and the app
 shows "Not configured".
 
 ---
@@ -219,7 +215,7 @@ and the redirect URL must match `SSO_REDIRECT_URI` exactly.
 
 | File | Purpose |
 |------|---------|
-| `app.py` | The whole app — all three flows, the redirect chain, token exchange, and the themed UI. |
+| `app.py` | The whole app — the redirect chain, token exchange, and the themed UI. |
 | `requirements.txt` | FastAPI + uvicorn/gunicorn + requests + itsdangerous. |
 | `startup.sh` | Azure App Service startup command (single gunicorn worker). |
 | `.env.example` | Every environment variable, documented. |
