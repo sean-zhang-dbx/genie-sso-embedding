@@ -1,56 +1,15 @@
 """
-Zero-popup SSO for embedding a Databricks Genie Space in an external app.
+Contoso Analytics Portal — host app that embeds a Databricks Genie Space.
 
-The app is registered as a Databricks custom OAuth app integration, so a single
-sign-in runs as one top-level redirect chain:
-
-  app /dbx-login
-    -> workspace /aad/auth?next_url=b64(/oidc/v1/authorize?...)
-    -> Entra (the ONE sign-in; silent if a session already exists)
-    -> workspace session cookie set as a side effect
-    -> /oidc/v1/authorize issues an auth code
-    -> back to app /callback2 (exchange code at /oidc/v1/token, SCIM /Me)
-
-After that the native Genie iframe loads directly against the established
-workspace session: no popup, no second prompt. Requested scope is only
-iam.current-user:read (identity), so the one-time Databricks consent screen is
-benign.
-
-Requires third-party cookies to be allowed (browser/IT policy) so the iframe can
-use the Databricks session.
+All the SSO/OAuth machinery lives in `genie_sso.py`. This file is intentionally
+thin: it owns the branded UI and wires in the SSO helper via three touch points
+(`sso.enabled`, `sso.get_session`, `sso.embed_url`) plus one `include_router`.
 """
 
-import base64
-import hashlib
-import os
-import secrets
-import time
-import urllib.parse
-
-import requests
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, RedirectResponse
-from itsdangerous import URLSafeSerializer, BadSignature
+from fastapi.responses import HTMLResponse
 
-SESSION_SECRET = os.environ.get("SESSION_SECRET", "dev-only-change-me")
-
-# ---- Databricks custom OAuth app integration + target Genie Space ----
-# These come from registering this app as an OAuth client on the Databricks
-# account. If any are blank, the app shows "Not configured".
-SSO_WS_HOST = os.environ.get("SSO_WS_HOST", "")        # no https://
-SSO_ORG_ID = os.environ.get("SSO_ORG_ID", "")          # the ?o= value
-SSO_SPACE_ID = os.environ.get("SSO_SPACE_ID", "")
-DBX_CLIENT_ID = os.environ.get("DBX_CLIENT_ID", "")
-DBX_CLIENT_SECRET = os.environ.get("DBX_CLIENT_SECRET", "")
-SSO_REDIRECT_URI = os.environ.get("SSO_REDIRECT_URI", "")  # must match the OAuth integration's redirect URL
-
-SSO_EMBED_URL = f"https://{SSO_WS_HOST}/embed/genie/rooms/{SSO_SPACE_ID}?o={SSO_ORG_ID}"
-SSO_ENABLED = all([SSO_WS_HOST, SSO_ORG_ID, SSO_SPACE_ID, DBX_CLIENT_ID, DBX_CLIENT_SECRET, SSO_REDIRECT_URI])
-
-# PKCE verifiers keyed by state nonce (single worker; pruned on use/expiry).
-_PKCE: dict = {}
-
-dbx_signer = URLSafeSerializer(SESSION_SECRET, salt="dbx-session")
+from genie_sso import GenieSSO
 
 app = FastAPI(title="Contoso Analytics Portal")
 
@@ -112,23 +71,27 @@ def _header(who: str = "") -> str:
 </header>"""
 
 
-def _dbx(request: Request):
-    c = request.cookies.get("dbx_session")
-    if not c:
-        return None
-    try:
-        return dbx_signer.loads(c)
-    except BadSignature:
-        return None
+def _branded_error(title: str, detail: str, retry_href: str) -> HTMLResponse:
+    """Branded error page handed to GenieSSO so sign-in/token errors keep the
+    Contoso shell instead of the library's minimal fallback."""
+    return HTMLResponse(_shell(
+        f'{_header()}<main><div class="card box"><h1>{title}</h1>'
+        f'<p>{detail}</p><a class="cta" href="{retry_href}">Try again</a></div></main>'),
+        status_code=400)
+
+
+# Loads config from env, registers /dbx-login, /callback2, /logout.
+sso = GenieSSO(error_page=_branded_error)
+app.include_router(sso.router)
 
 
 @app.get("/", response_class=HTMLResponse)
 def home(request: Request):
-    if not SSO_ENABLED:
+    if not sso.enabled:
         return HTMLResponse(_shell(
             f'{_header()}<main><div class="card box"><h1>Not configured</h1>'
             f'<p>The Databricks OAuth client settings (SSO_*) are missing.</p></div></main>'))
-    sess = _dbx(request)
+    sess = sso.get_session(request)
     if not sess:
         body = f"""
 {_header()}
@@ -137,7 +100,7 @@ def home(request: Request):
   <p>One sign-in, one redirect chain: this app is a registered Databricks OAuth client,
      so authenticating also establishes your Databricks session on the way through.
      No popup, no second prompt &mdash; Genie loads embedded immediately after.</p>
-  <a class="cta" href="/dbx-login">&#128273;&nbsp; Sign in once</a>
+  <a class="cta" href="{sso.login_path}">&#128273;&nbsp; Sign in once</a>
 </div></main>"""
         return HTMLResponse(_shell(body))
     who = sess.get("email") or "Signed in"
@@ -147,93 +110,12 @@ def home(request: Request):
   <div class="stepbar ok"><b>Zero-friction SSO.</b> Your single sign-in also established the
   Databricks session &mdash; the native Genie iframe below loaded with no popup and no extra prompts.</div>
   <div class="embed-wrap"><div class="embed-card">
-    <iframe src="{SSO_EMBED_URL}" allow="clipboard-write" width="100%" height="600" frameborder="0"></iframe>
+    <iframe src="{sso.embed_url}" allow="clipboard-write" width="100%" height="600" frameborder="0"></iframe>
   </div></div>
 </div></main>"""
     return HTMLResponse(_shell(body))
 
 
-@app.get("/dbx-login")
-def dbx_login():
-    if not SSO_ENABLED:
-        return RedirectResponse("/", status_code=302)
-    # Prune stale PKCE entries.
-    now = time.time()
-    for k in [k for k, v in _PKCE.items() if now - v[1] > 600]:
-        _PKCE.pop(k, None)
-
-    state = secrets.token_urlsafe(16)
-    verifier = secrets.token_urlsafe(48)
-    challenge = base64.urlsafe_b64encode(
-        hashlib.sha256(verifier.encode()).digest()).decode().rstrip("=")
-    _PKCE[state] = (verifier, now)
-
-    authorize_rel = "/oidc/v1/authorize?" + urllib.parse.urlencode({
-        "client_id": DBX_CLIENT_ID,
-        "redirect_uri": SSO_REDIRECT_URI,
-        "response_type": "code",
-        "state": state,
-        "code_challenge": challenge,
-        "code_challenge_method": "S256",
-        # Minimal scope: the token is only used to identify the user (SCIM /Me).
-        # The Genie iframe runs on the browser session, not this token — and
-        # narrow scope keeps the consent screen benign (no "all-apis" warning).
-        "scope": "iam.current-user:read",
-    })
-    next_b64 = urllib.parse.quote(base64.b64encode(authorize_rel.encode()).decode(), safe="")
-    return RedirectResponse(f"https://{SSO_WS_HOST}/aad/auth?next_url={next_b64}", status_code=302)
-
-
-@app.get("/callback2")
-def callback2(request: Request):
-    err = request.query_params.get("error")
-    if err:
-        return HTMLResponse(_shell(
-            f'{_header()}<main><div class="card box"><h1>Sign-in failed</h1>'
-            f'<p>{err}: {request.query_params.get("error_description","")}</p>'
-            f'<a class="cta" href="/dbx-login">Try again</a></div></main>'), status_code=400)
-    code = request.query_params.get("code")
-    state = request.query_params.get("state")
-    entry = _PKCE.pop(state, None) if state else None
-    if not code or not entry:
-        return RedirectResponse("/", status_code=302)
-    verifier = entry[0]
-
-    tr = requests.post(f"https://{SSO_WS_HOST}/oidc/v1/token", data={
-        "client_id": DBX_CLIENT_ID,
-        "client_secret": DBX_CLIENT_SECRET,
-        "grant_type": "authorization_code",
-        "code": code,
-        "redirect_uri": SSO_REDIRECT_URI,
-        "code_verifier": verifier,
-    }, timeout=30)
-    if tr.status_code != 200:
-        return HTMLResponse(_shell(
-            f'{_header()}<main><div class="card box"><h1>Token exchange failed</h1>'
-            f'<p>{tr.status_code}: {tr.text[:300]}</p><a class="cta" href="/dbx-login">Try again</a></div></main>'),
-            status_code=400)
-    access_token = tr.json().get("access_token", "")
-
-    # Resolve identity via the workspace itself.
-    email = None
-    me = requests.get(f"https://{SSO_WS_HOST}/api/2.0/preview/scim/v2/Me",
-                      headers={"Authorization": f"Bearer {access_token}"}, timeout=30)
-    if me.status_code == 200:
-        email = me.json().get("userName")
-
-    resp = RedirectResponse("/", status_code=302)
-    resp.set_cookie("dbx_session", dbx_signer.dumps({"email": email}),
-                    httponly=True, secure=True, samesite="lax", max_age=8 * 3600)
-    return resp
-
-
-@app.get("/logout")
-def logout():
-    resp = RedirectResponse("/", status_code=302)
-    resp.delete_cookie("dbx_session")
-    return resp
-
-
 @app.get("/healthz")
 def healthz():
-    return {"ok": True, "build": "zero-popup-only", "sso_enabled": SSO_ENABLED}
+    return {"ok": True, "build": "zero-popup-only", "sso_enabled": sso.enabled}
