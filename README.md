@@ -211,6 +211,31 @@ and the redirect URL must match `SSO_REDIRECT_URI` exactly.
 
 ---
 
+## "Can users sign into our app without signing in again to Genie?"
+
+Yes — if the app already logs users in via **MSAL** (an Entra session), the iframe can load
+with no second credential prompt, but **not automatically**. MSAL produces an *Entra*
+session + token; the Genie iframe renders off a *Databricks session cookie* — a different
+thing MSAL never creates. You have to mint that cookie once, top-level, by hitting the
+workspace `/aad/auth` endpoint (it can't run inside the iframe — Microsoft sends
+`X-Frame-Options: DENY` on its login pages). Because MSAL already established the Entra
+session, that `/aad/auth` hop is **silent**, so the user re-types nothing.
+
+Two ways to run that cookie-mint step:
+
+- **Zero-popup (this repo, `/dbx-login`):** fully seamless, but **requires** a Databricks
+  account-admin to register the custom OAuth app integration.
+- **Popup bootstrap:** a brief top-level popup opens `/aad/auth`, mints the cookie
+  (silent with a live Entra session), auto-closes, then the iframe loads. **No
+  account-admin needed** — the pragmatic option when paired with an existing MSAL login.
+
+**Hard dependency either way:** third-party cookies must be allowed for the workspace
+domain in the user's browser, so the iframe can use the Databricks session cookie. If IT
+policy blocks them, no pattern can avoid the in-frame second login — it's a browser
+boundary, not a code problem.
+
+---
+
 ## Files
 
 | File | Purpose |
