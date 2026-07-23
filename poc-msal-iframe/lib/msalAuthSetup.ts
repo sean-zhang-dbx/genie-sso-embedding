@@ -57,15 +57,23 @@ const msalConfig: Configuration = {
   },
 }
 
-// Login request — Databricks .default scope so the consent + token target the
-// Azure Databricks resource, same as GSK.
+// Login request. NOTE: for the IFRAME path we intentionally do NOT request the
+// Databricks .default scope. The iframe authenticates via the Databricks
+// session cookie (minted by genieBootstrap), not a Bearer token — so no
+// Databricks token is needed here. Requesting only identity + User.Read keeps
+// the flow USER-CONSENTABLE (the Databricks .default scope requires tenant
+// admin consent, which is why GSK's app had to be admin-approved once).
+//
+// GSK's own broader app requests DBX_SCOPE because it also calls Databricks
+// APIs with the token. If you need that too, add AUTH_CONFIG.DBX_SCOPE back —
+// but expect the admin-consent screen.
 export const loginRequest: PopupRequest = {
-  scopes: [AUTH_CONFIG.DBX_SCOPE],
+  scopes: ["User.Read"],
   prompt: "select_account",
 }
 
 export const silentRequest: SilentRequest = {
-  scopes: [AUTH_CONFIG.DBX_SCOPE],
+  scopes: ["User.Read"],
 }
 
 // Graph API request — separate scope for checking group membership.
@@ -269,6 +277,9 @@ export const authHelpers = {
     })
   },
 
+  // Returns the token for `silentRequest`'s scopes (User.Read here). The iframe
+  // path doesn't use this — it's kept for parity with GSK's helper. To call
+  // Databricks APIs, request AUTH_CONFIG.DBX_SCOPE instead (needs admin consent).
   getAccessToken: async (): Promise<string | null> => {
     try {
       const account = msalInstance.getActiveAccount()
