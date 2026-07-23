@@ -116,18 +116,20 @@ export function newPkce(): Pkce {
   return { state, verifier, challenge }
 }
 
-/** The signed PKCE cookie value carrying {state, verifier} through the redirect. */
-export function encodePkceCookie(pkce: Pkce, secret: string): string {
-  return encodeSession({ state: pkce.state, verifier: pkce.verifier }, secret)
+/** The signed PKCE cookie value carrying {state, verifier} through the redirect.
+ *  `silent` records whether this mint was started in a hidden iframe, so the
+ *  callback knows to postMessage the parent instead of issuing a redirect. */
+export function encodePkceCookie(pkce: Pkce, secret: string, silent = false): string {
+  return encodeSession({ state: pkce.state, verifier: pkce.verifier, silent }, secret)
 }
 
 export function decodePkceCookie(
   cookie: string | undefined,
   secret: string,
-): { state: string; verifier: string } | null {
+): { state: string; verifier: string; silent: boolean } | null {
   const d = decodeSession(cookie, secret)
   if (!d || typeof d.state !== "string" || typeof d.verifier !== "string") return null
-  return { state: d.state, verifier: d.verifier }
+  return { state: d.state, verifier: d.verifier, silent: d.silent === true }
 }
 
 // ---- The /aad/auth redirect URL (mirrors _login in the Python lib) ---------
@@ -182,4 +184,21 @@ export async function resolveIdentity(cfg: GenieSsoConfig, accessToken: string):
   if (!r.ok) return null
   const data = (await r.json()) as { userName?: string }
   return data.userName || null
+}
+
+// The message type the silent-completion page posts to the parent window.
+export const GENIE_MINT_MESSAGE = "genie-sso:mint-complete"
+
+/** HTML for the silent-mode callback. Rendered inside the hidden re-mint iframe;
+ *  it posts the outcome to the parent window and does nothing visible. The
+ *  parent listens for GENIE_MINT_MESSAGE. targetOrigin is the app's own origin,
+ *  so the message never leaks cross-origin. */
+export function silentCompletionHtml(ok: boolean, origin: string, detail = ""): string {
+  const payload = JSON.stringify({ type: GENIE_MINT_MESSAGE, ok, detail })
+  // origin and payload are server-controlled (config + booleans), not user input.
+  return `<!DOCTYPE html><html><head><meta charset="utf-8"></head><body>
+<script>
+  try { window.parent.postMessage(${payload}, ${JSON.stringify(origin)}); } catch (e) {}
+</script>
+</body></html>`
 }

@@ -67,6 +67,55 @@ export function startServerMint(): void {
   window.location.assign("/api/dbx-login")
 }
 
+// The message the silent callback posts back to us (mirror of GENIE_MINT_MESSAGE
+// in genieSso.ts — duplicated here to avoid importing a server module into the
+// client bundle).
+const GENIE_MINT_MESSAGE = "genie-sso:mint-complete"
+
+// Re-establish the Databricks session WITHOUT a visible redirect or popup, by
+// running the mint chain inside a hidden iframe. Works only when Entra can
+// complete the /aad/auth hop silently (MSAL session still valid). If Entra needs
+// to show a page, X-Frame-Options blocks it in the hidden frame and we time out —
+// the caller then falls back to a visible re-auth (startServerMint).
+//
+// Returns true if the session was refreshed, false if it timed out / failed.
+export function silentRemint(timeoutMs = 8000): Promise<boolean> {
+  return new Promise((resolve) => {
+    if (typeof window === "undefined") return resolve(false)
+
+    const frame = document.createElement("iframe")
+    frame.style.display = "none"
+    frame.setAttribute("aria-hidden", "true")
+    frame.src = "/api/dbx-login?silent=1"
+
+    let done = false
+    const cleanup = () => {
+      window.removeEventListener("message", onMessage)
+      clearTimeout(timer)
+      try { frame.remove() } catch { /* already gone */ }
+    }
+    const finish = (ok: boolean) => {
+      if (done) return
+      done = true
+      cleanup()
+      resolve(ok)
+    }
+
+    const onMessage = (e: MessageEvent) => {
+      // Only trust messages from our own origin and our message type.
+      if (e.origin !== window.location.origin) return
+      const data = e.data
+      if (!data || data.type !== GENIE_MINT_MESSAGE) return
+      finish(Boolean(data.ok))
+    }
+
+    window.addEventListener("message", onMessage)
+    // If Entra can't go silent, the frame stalls on a blocked login page; time out.
+    const timer = setTimeout(() => finish(false), timeoutMs)
+    document.body.appendChild(frame)
+  })
+}
+
 // ---- popup mode (original client-only mint; no server, no OAuth app) --------
 
 function aadAuthUrl(): string {
