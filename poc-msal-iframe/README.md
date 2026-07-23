@@ -22,17 +22,38 @@ established the Entra session, that hop is **silent** — no credential prompt �
 the Databricks session cookie as a side effect. The iframe then loads against that cookie.
 
 ```
-MSAL loginPopup ─► Graph group check ─► [NEW] top-level /aad/auth popup (silent) ─► Genie iframe loads
-   (Entra session)     (valid user?)        (mints Databricks cookie)                (no 2nd login)
+MSAL loginPopup ─► Graph group check ─► [NEW] top-level /aad/auth (silent) ─► Genie iframe loads
+   (Entra session)     (valid user?)        (mints Databricks cookie)          (no 2nd login)
 ```
+
+## Two mint strategies (`NEXT_PUBLIC_MINT_MODE`)
+
+The cookie mint can run two ways. Both hit `/aad/auth` top-level and both need
+third-party cookies; they differ in whether a Databricks account-admin is required.
+
+| Mode | How it mints the cookie | Databricks account-admin? | UX |
+|------|-------------------------|---------------------------|-----|
+| **`server`** (default) | Server-side confidential-OAuth redirect chain, ported from the parent repo's Python `genie_sso` library into `app/api/*` + `lib/genieSso.ts`. Full-page redirect. | **Required** (register a custom OAuth app) | Fully seamless, no popup |
+| **`popup`** | Client-only brief popup to `/aad/auth` that auto-closes. | **Not needed** | A short popup flashes |
+
+Server mode is how you make the parent repo's `genie_sso` usable from this SPA:
+its logic runs in Next.js **route handlers** (Node runtime), so the Databricks
+**client secret stays server-side** — impossible in a pure browser SPA. PKCE
+verifiers ride a short-lived signed httpOnly cookie instead of the Python
+version's in-process dict, so it also works across multiple server instances
+(no single-worker constraint).
 
 ## Files
 
 | File | Role |
 |------|------|
 | `lib/msalAuthSetup.ts` | MSAL config + Graph group checks. **Mirrors GSK's file** (scopes unified to the Databricks resource). |
-| `lib/AuthProvider.tsx` | React auth context. **Mirrors GSK's**, plus `genieReady`/`prepareGenie` that run the bootstrap once group access passes. |
-| `lib/genieBootstrap.ts` | **The new piece.** Top-level `/aad/auth` cookie mint + the `/embed/genie/rooms/...` URL builder. |
+| `lib/AuthProvider.tsx` | React auth context. **Mirrors GSK's**, plus `genieReady`/`prepareGenie` that run the mint (server or popup) once group access passes. |
+| `lib/genieBootstrap.ts` | Mint dispatch: `startServerMint()` / `genieStatus()` (server mode) and `bootstrapDatabricksSessionPopup()` (popup mode) + the `/embed/genie/rooms/...` URL builder. |
+| `lib/genieSso.ts` | **Server-only.** The `genie_sso` logic ported to TypeScript: PKCE, `/aad/auth` URL, token exchange, SCIM identity, signed cookies. Imported only by `app/api/*`. |
+| `app/api/dbx-login/route.ts` | Starts the server mint chain (sets PKCE cookie, redirects to `/aad/auth`). |
+| `app/api/callback2/route.ts` | OAuth landing: code→token, SCIM identity, sets the signed `dbx_session` cookie. `DBX_REDIRECT_URI` must point here. |
+| `app/api/genie-status/route.ts` | Reports whether the session cookie is minted, so the client reveals the iframe or triggers the mint. |
 | `app/page.tsx` | Sign-in → group gate → "connecting…" → Genie iframe. |
 | `app/layout.tsx` | Wraps everything in `AuthProvider`. |
 
@@ -64,8 +85,19 @@ security boundary. Verify GSK's managed-browser policy before promising the seam
 
 ## How this relates to the parent repo
 
-The parent `genie-sso-embedding` app does the same cookie mint via a **server-side
-confidential OAuth client** (the zero-popup `/v0` flow), which is fully seamless but
-**requires a Databricks account-admin** to register a custom OAuth app integration. This PoC
-uses the **popup-bootstrap** approach instead: slightly less polished (a brief popup) but
-**needs no account-admin**, and drops directly into GSK's existing MSAL frontend.
+The parent `genie-sso-embedding` app does the cookie mint via a **server-side confidential
+OAuth client** (Python/FastAPI), fully seamless but **requiring a Databricks account-admin**
+to register a custom OAuth app integration.
+
+This PoC now supports **both** approaches (see *Two mint strategies* above):
+
+- **`popup` mode** — the original client-only bootstrap. No account-admin, drops straight
+  into GSK's existing MSAL frontend; the cost is a brief popup.
+- **`server` mode** — the parent repo's Python `genie_sso` logic **ported natively to
+  TypeScript** (`lib/genieSso.ts` + `app/api/*`). This is how you use `genie_sso` from a
+  SPA: it can't be imported into browser code, so its server-side flow runs in Next.js route
+  handlers within this same app — no separate Python service, and the client secret stays on
+  the server. Fully seamless, but inherits the account-admin OAuth-app requirement.
+
+Pick `server` when account-admin is available and you want zero popups; pick `popup` when it
+isn't. Everything else (MSAL, Graph group gate, iframe) is identical between the two.

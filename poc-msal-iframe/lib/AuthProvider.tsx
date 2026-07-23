@@ -3,12 +3,23 @@
 import React, { createContext, useContext, useEffect, useState, ReactNode, useCallback } from 'react';
 import { AccountInfo } from '@azure/msal-browser';
 import { initializeMsal, authHelpers } from './msalAuthSetup';
-import { bootstrapDatabricksSession } from './genieBootstrap';
+import {
+  mintMode,
+  genieStatus,
+  startServerMint,
+  bootstrapDatabricksSessionPopup,
+} from './genieBootstrap';
 
 // Mirrors GSK's AuthProvider. The additions for the iframe PoC are:
-//   - `genieReady` state + `prepareGenie()` which runs the top-level /aad/auth
-//     cookie mint once group access passes, BEFORE the iframe is shown.
+//   - `genieReady` state + `prepareGenie()` which runs the /aad/auth cookie mint
+//     once group access passes, BEFORE the iframe is shown.
 // Everything else (MSAL init, silent login, group gating) matches GSK.
+//
+// prepareGenie() supports two mint strategies (NEXT_PUBLIC_MINT_MODE):
+//   - "server" (default): check /api/genie-status; if not yet minted, full-page
+//     redirect into /api/dbx-login (the ported genie_sso chain). On return the
+//     status reads ready=true and the iframe is revealed. No popup.
+//   - "popup": the original client-only popup bootstrap.
 
 interface UserInfo {
   sub?: string;
@@ -104,7 +115,23 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
     if (genieReady || geniePreparing) return;
     try {
       setGeniePreparing(true);
-      await bootstrapDatabricksSession();
+
+      if (mintMode() === 'server') {
+        // Server mode: is the Databricks cookie already minted this session?
+        const status = await genieStatus();
+        if (status.ready) {
+          setGenieReady(true);
+          return;
+        }
+        // Not yet — full-page redirect into the server mint chain. This
+        // navigates away; on return, initializeAuth() runs prepareGenie() again
+        // and genieStatus() now reports ready=true.
+        startServerMint();
+        return; // navigation in flight; nothing more to do here
+      }
+
+      // Popup mode: original client-only bootstrap.
+      await bootstrapDatabricksSessionPopup();
       setGenieReady(true);
     } catch (err) {
       console.error('Genie bootstrap failed:', err);

@@ -1,26 +1,40 @@
 // -----------------------------------------------------------------------------
-// The ONE piece GSK's MSAL code is missing.
+// The ONE piece GSK's MSAL code is missing: establishing the Databricks SESSION
+// COOKIE the Genie iframe needs (MSAL only ever produces an Entra session +
+// token; a Bearer token cannot authenticate an iframe, so without this step the
+// iframe hits Databricks' own login = the second sign-in).
 //
-// After MSAL sign-in, the browser holds an ENTRA session + tokens. But the Genie
-// iframe authenticates with a DATABRICKS SESSION COOKIE, which MSAL never
-// creates. A Bearer token cannot authenticate an iframe. So without this step
-// the iframe hits Databricks' own login = the second sign-in.
+// Two mint strategies, selected with NEXT_PUBLIC_MINT_MODE:
 //
-// This mints the Databricks cookie by hitting the workspace /aad/auth endpoint
-// TOP-LEVEL (never inside the iframe — Microsoft sends X-Frame-Options: DENY on
-// its login pages, so an in-frame attempt fails). Because MSAL already
-// established the Entra session, that /aad/auth -> Entra hop is SILENT: no
-// credential prompt. A brief popup does it, then auto-closes.
+//   "server" (default) — hand off to the server-side route /api/dbx-login, which
+//       runs the confidential-OAuth redirect chain (ported from the Python
+//       genie_sso library into app/api + lib/genieSso.ts) and plants the cookie.
+//       Fully seamless: a top-level redirect, no popup. REQUIRES a Databricks
+//       account-admin to register a custom OAuth app integration.
 //
-// HARD DEPENDENCY: third-party cookies must be allowed for the workspace domain,
-// or the iframe can't use the cookie and you fall back to the in-frame login.
-// That is a browser/IT policy boundary, not something code can override.
+//   "popup" — the original client-only approach: a brief top-level popup to
+//       /aad/auth that auto-closes. Needs NO OAuth-app registration. Kept for
+//       environments where account-admin approval isn't available.
+//
+// Both mints hit /aad/auth TOP-LEVEL (never inside the iframe — Microsoft sends
+// X-Frame-Options: DENY on its login pages). Because MSAL already established the
+// Entra session, that /aad/auth -> Entra hop is SILENT: no credential prompt.
+//
+// HARD DEPENDENCY (both modes): third-party cookies must be allowed for the
+// workspace domain, or the iframe can't use the cookie and the in-frame second
+// login returns. Browser/IT policy boundary — not something code can override.
 // -----------------------------------------------------------------------------
 
 export const GENIE_CONFIG = {
   WS_HOST: process.env.NEXT_PUBLIC_GENIE_WS_HOST!,   // e.g. adb-984752964297111.11.azuredatabricks.net (no https://)
   ORG_ID: process.env.NEXT_PUBLIC_GENIE_ORG_ID!,     // the ?o= value
   SPACE_ID: process.env.NEXT_PUBLIC_GENIE_SPACE_ID!, // the Genie space id
+}
+
+export type MintMode = "server" | "popup"
+
+export function mintMode(): MintMode {
+  return (process.env.NEXT_PUBLIC_MINT_MODE as MintMode) || "server"
 }
 
 // The embeddable Genie surface. IMPORTANT: use /embed/genie/rooms/... — it
@@ -31,9 +45,30 @@ export function genieEmbedUrl(): string {
   return `https://${GENIE_CONFIG.WS_HOST}/embed/genie/rooms/${GENIE_CONFIG.SPACE_ID}?o=${GENIE_CONFIG.ORG_ID}`
 }
 
-// The top-level /aad/auth URL that mints the Databricks session cookie and then
-// forwards to the embed path. next_url must be base64 of the RELATIVE embed
-// path; browsers handle the URL-encoding of the query param for us.
+// ---- server mode -----------------------------------------------------------
+
+// Is the Databricks session already minted this browser session? Asks the
+// server route, which reads the signed httpOnly session cookie.
+export async function genieStatus(): Promise<{ configured: boolean; ready: boolean; email: string | null }> {
+  try {
+    const r = await fetch("/api/genie-status", { cache: "no-store" })
+    if (!r.ok) return { configured: false, ready: false, email: null }
+    return await r.json()
+  } catch {
+    return { configured: false, ready: false, email: null }
+  }
+}
+
+// Full-page navigation to the server mint route. It redirects the browser
+// TOP-LEVEL through /aad/auth (silent) and back to the app with the Databricks
+// cookie planted. A full-page redirect — not fetch — is required so the browser
+// follows the cross-origin hops and stores the workspace cookie.
+export function startServerMint(): void {
+  window.location.assign("/api/dbx-login")
+}
+
+// ---- popup mode (original client-only mint; no server, no OAuth app) --------
+
 function aadAuthUrl(): string {
   const relative = `/embed/genie/rooms/${GENIE_CONFIG.SPACE_ID}?o=${GENIE_CONFIG.ORG_ID}`
   const nextB64 = btoa(relative)
@@ -43,7 +78,7 @@ function aadAuthUrl(): string {
 // Open a brief top-level popup to establish the Databricks session, then close
 // it. Resolves once the popup closes or after `autocloseMs`. The caller reveals
 // the iframe afterward.
-export function bootstrapDatabricksSession(autocloseMs = 6000): Promise<void> {
+export function bootstrapDatabricksSessionPopup(autocloseMs = 6000): Promise<void> {
   return new Promise((resolve) => {
     const w = 480
     const h = 640
