@@ -60,7 +60,9 @@ class GenieSSOConfig:
         client_secret: str = None,
         redirect_uri: str = None,     # must match the OAuth integration's redirect URL
         session_secret: str = None,
+        scheme: str = None,           # "https" in prod; "http" only for local mock/testing
         cookie_name: str = "dbx_session",
+        cookie_secure: bool = True,   # always True in prod; False only for http local testing
         session_max_age: int = 8 * 3600,
     ):
         self.ws_host = ws_host if ws_host is not None else os.environ.get("SSO_WS_HOST", "")
@@ -77,7 +79,9 @@ class GenieSSOConfig:
             session_secret if session_secret is not None
             else os.environ.get("SESSION_SECRET", "dev-only-change-me")
         )
+        self.scheme = scheme if scheme is not None else os.environ.get("SSO_SCHEME", "https")
         self.cookie_name = cookie_name
+        self.cookie_secure = cookie_secure
         self.session_max_age = session_max_age
 
     @property
@@ -88,8 +92,12 @@ class GenieSSOConfig:
         ])
 
     @property
+    def base_url(self) -> str:
+        return f"{self.scheme}://{self.ws_host}"
+
+    @property
     def embed_url(self) -> str:
-        return f"https://{self.ws_host}/embed/genie/rooms/{self.space_id}?o={self.org_id}"
+        return f"{self.base_url}/embed/genie/rooms/{self.space_id}?o={self.org_id}"
 
 
 def _default_error_page(title: str, detail: str, retry_href: str) -> HTMLResponse:
@@ -203,7 +211,7 @@ class GenieSSO:
         })
         next_b64 = urllib.parse.quote(base64.b64encode(authorize_rel.encode()).decode(), safe="")
         return RedirectResponse(
-            f"https://{self.cfg.ws_host}/aad/auth?next_url={next_b64}", status_code=302)
+            f"{self.cfg.base_url}/aad/auth?next_url={next_b64}", status_code=302)
 
     def _callback(self, request: Request):
         err = request.query_params.get("error")
@@ -220,7 +228,7 @@ class GenieSSO:
             return RedirectResponse(self.success_redirect, status_code=302)
         verifier = entry[0]
 
-        tr = requests.post(f"https://{self.cfg.ws_host}/oidc/v1/token", data={
+        tr = requests.post(f"{self.cfg.base_url}/oidc/v1/token", data={
             "client_id": self.cfg.client_id,
             "client_secret": self.cfg.client_secret,
             "grant_type": "authorization_code",
@@ -235,14 +243,14 @@ class GenieSSO:
 
         # Resolve identity via the workspace itself.
         email = None
-        me = requests.get(f"https://{self.cfg.ws_host}/api/2.0/preview/scim/v2/Me",
+        me = requests.get(f"{self.cfg.base_url}/api/2.0/preview/scim/v2/Me",
                           headers={"Authorization": f"Bearer {access_token}"}, timeout=30)
         if me.status_code == 200:
             email = me.json().get("userName")
 
         resp = RedirectResponse(self.success_redirect, status_code=302)
         resp.set_cookie(self.cfg.cookie_name, self._signer.dumps({"email": email}),
-                        httponly=True, secure=True, samesite="lax",
+                        httponly=True, secure=self.cfg.cookie_secure, samesite="lax",
                         max_age=self.cfg.session_max_age)
         return resp
 
