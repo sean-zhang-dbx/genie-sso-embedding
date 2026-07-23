@@ -54,6 +54,7 @@ export default function Home() {
   const {
     isAuthenticated, isLoading, login, error, accessDenied,
     getUserName, getUserEmail, genieReady, geniePreparing,
+    genieReconnecting, genieFrameKey,
   } = useAuth();
 
   if (isLoading) {
@@ -133,15 +134,30 @@ export default function Home() {
         <div style={{ flex: 1, display: 'flex', padding: '14px 18px 18px', minHeight: 0 }}>
           <div
             style={{
-              flex: 1, display: 'flex', minHeight: 0, background: '#fff',
+              flex: 1, position: 'relative', display: 'flex', minHeight: 0, background: '#fff',
               border: '1px solid #e2e6e9', borderRadius: 10, overflow: 'hidden',
             }}
           >
             <iframe
+              key={genieFrameKey}
               src={genieEmbedUrl()}
               allow="clipboard-write"
               style={{ border: 'none', width: '100%', height: '100%' }}
             />
+            {genieReconnecting && (
+              <div
+                style={{
+                  position: 'absolute', inset: 0, display: 'flex', flexDirection: 'column',
+                  alignItems: 'center', justifyContent: 'center', gap: 8,
+                  background: 'rgba(255,255,255,.92)', color: BRAND,
+                }}
+              >
+                <div style={{ fontSize: 15, fontWeight: 600 }}>Reconnecting to Genie…</div>
+                <div style={{ fontSize: 12.5, color: '#6b7680' }}>
+                  Restoring your Databricks session.
+                </div>
+              </div>
+            )}
           </div>
         </div>
       </div>

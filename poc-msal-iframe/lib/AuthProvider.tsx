@@ -1,12 +1,13 @@
 'use client';
 
-import React, { createContext, useContext, useEffect, useState, ReactNode, useCallback } from 'react';
-import { AccountInfo } from '@azure/msal-browser';
-import { initializeMsal, authHelpers } from './msalAuthSetup';
+import React, { createContext, useContext, useEffect, useState, ReactNode, useCallback, useRef } from 'react';
+import { AccountInfo, EventType, EventMessage } from '@azure/msal-browser';
+import { initializeMsal, authHelpers, msalInstance } from './msalAuthSetup';
 import {
   mintMode,
   genieStatus,
   startServerMint,
+  silentRemint,
   bootstrapDatabricksSessionPopup,
 } from './genieBootstrap';
 
@@ -20,6 +21,14 @@ import {
 //     redirect into /api/dbx-login (the ported genie_sso chain). On return the
 //     status reads ready=true and the iframe is revealed. No popup.
 //   - "popup": the original client-only popup bootstrap.
+//
+// Session lifecycle (server mode):
+//   - Gap 1 (token refresh): on every MSAL silent token renewal we run a hidden
+//     silent re-mint so the Databricks session tracks the app session.
+//   - Gap 2 (cross-window Databricks logout): on window focus / visibility we
+//     re-mint silently and reload the iframe behind a "Reconnecting" overlay, so
+//     the user never sees Databricks' in-iframe login button. If the silent
+//     re-mint fails (Entra also expired), we fall back to a visible re-auth.
 
 interface UserInfo {
   sub?: string;
@@ -45,8 +54,10 @@ interface AuthContextType {
   userGroups: string[];
   accessDenied: boolean;
   // iframe PoC additions:
-  genieReady: boolean;      // Databricks cookie minted, iframe safe to render
-  geniePreparing: boolean;  // bootstrap popup in progress
+  genieReady: boolean;        // Databricks cookie minted, iframe safe to render
+  geniePreparing: boolean;    // initial bootstrap in progress
+  genieReconnecting: boolean; // silent re-mint / recovery in progress (show overlay)
+  genieFrameKey: number;      // bump to force the Genie iframe to reload
 }
 
 const AuthContext = createContext<AuthContextType | undefined>(undefined);
@@ -78,6 +89,10 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
   const [accessDenied, setAccessDenied] = useState(false);
   const [genieReady, setGenieReady] = useState(false);
   const [geniePreparing, setGeniePreparing] = useState(false);
+  const [genieReconnecting, setGenieReconnecting] = useState(false);
+  const [genieFrameKey, setGenieFrameKey] = useState(0);
+  // Guards against overlapping recovery runs (focus can fire in bursts).
+  const recoveringRef = useRef(false);
 
   const getUserEmail = (): string | null => {
     if (user?.email) return user.email;
@@ -143,6 +158,38 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
     }
   }, [genieReady, geniePreparing]);
 
+  // Keep the Databricks session alive / recover it without the user ever seeing
+  // Databricks' in-iframe login. Runs a hidden silent re-mint:
+  //   - success  -> reload the iframe so it picks up the refreshed cookie
+  //   - failure  -> Entra can't go silent either; fall back to a visible re-auth
+  // `showOverlay` covers the iframe during focus-triggered recovery (Gap 2). The
+  // proactive MSAL-renewal path (Gap 1) runs without an overlay.
+  const recoverGenieSession = useCallback(
+    async (showOverlay: boolean): Promise<void> => {
+      if (mintMode() !== 'server') return;      // popup mode has no silent path
+      if (recoveringRef.current) return;         // de-dupe bursts of focus events
+      recoveringRef.current = true;
+      if (showOverlay) setGenieReconnecting(true);
+      try {
+        const ok = await silentRemint();
+        if (ok) {
+          // Cookie refreshed. Reload the iframe so a dead session is replaced.
+          setGenieFrameKey((k) => k + 1);
+        } else if (showOverlay) {
+          // Silent path blocked (Entra session gone). Visible re-auth — this is
+          // a genuine full re-login, not just the Databricks cookie.
+          startServerMint();
+        }
+      } catch (err) {
+        console.error('Genie session recovery failed:', err);
+      } finally {
+        recoveringRef.current = false;
+        setGenieReconnecting(false);
+      }
+    },
+    [],
+  );
+
   useEffect(() => {
     const initializeAuth = async () => {
       try {
@@ -202,6 +249,42 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
     if (isAuthenticated && hasGroupAccess) prepareGenie();
   }, [isAuthenticated, hasGroupAccess, prepareGenie]);
 
+  // Gap 1 — token refresh. MSAL raises ACQUIRE_TOKEN_SUCCESS on every silent
+  // Entra token renewal. Piggyback on it to refresh the Databricks session on
+  // the same cadence, so the cookie never drifts out of sync with the app
+  // session. No overlay: this is proactive upkeep, not a user-visible recovery.
+  useEffect(() => {
+    if (!genieReady) return;
+    const callbackId = msalInstance.addEventCallback((message: EventMessage) => {
+      if (
+        message.eventType === EventType.ACQUIRE_TOKEN_SUCCESS ||
+        message.eventType === EventType.SSO_SILENT_SUCCESS
+      ) {
+        recoverGenieSession(false);
+      }
+    });
+    return () => {
+      if (callbackId) msalInstance.removeEventCallback(callbackId);
+    };
+  }, [genieReady, recoverGenieSession]);
+
+  // Gap 2 — cross-window Databricks logout. When the user returns to the app tab
+  // (the exact moment described: they log out of Databricks elsewhere, then come
+  // back), re-establish the session silently behind an overlay and reload the
+  // iframe. The user never has to touch Databricks' in-iframe login button.
+  useEffect(() => {
+    if (!genieReady) return;
+    const onFocus = () => {
+      if (document.visibilityState === 'visible') recoverGenieSession(true);
+    };
+    window.addEventListener('focus', onFocus);
+    document.addEventListener('visibilitychange', onFocus);
+    return () => {
+      window.removeEventListener('focus', onFocus);
+      document.removeEventListener('visibilitychange', onFocus);
+    };
+  }, [genieReady, recoverGenieSession]);
+
   const login = async (): Promise<void> => {
     try {
       setIsLoading(true);
@@ -245,6 +328,7 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
       setUserGroups([]);
       setAccessDenied(false);
       setGenieReady(false);
+      setGenieReconnecting(false);
     } catch (err) {
       console.error('Logout error:', err);
       setError(err instanceof Error ? err.message : 'Logout failed');
@@ -278,6 +362,8 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
     accessDenied,
     genieReady,
     geniePreparing,
+    genieReconnecting,
+    genieFrameKey,
   };
 
   return <AuthContext.Provider value={contextValue}>{children}</AuthContext.Provider>;
