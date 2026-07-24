@@ -6,8 +6,8 @@
 
 import { NextRequest, NextResponse } from "next/server"
 import {
-  loadConfig, isConfigured, aadAuthUrl, newPkce,
-  encodePkceCookie, COOKIE_PKCE, PKCE_MAX_AGE_SEC,
+  loadConfig, isConfigured, aadAuthUrl, newPkce, encodePkceCookie,
+  COOKIE_PKCE, PKCE_MAX_AGE_SEC, type MintCarrier,
 } from "../../../lib/genieSso"
 
 export const runtime = "nodejs"          // needs node:crypto + the client secret
@@ -22,14 +22,18 @@ export async function GET(req: NextRequest) {
     )
   }
 
-  // silent=1 means this chain runs inside a hidden iframe (token refresh or
-  // session recovery); the callback will postMessage the parent instead of
-  // redirecting. Recorded in the signed PKCE cookie so it survives the round-trip.
-  const silent = req.nextUrl.searchParams.get("silent") === "1"
+  // carrier tells /api/callback2 how the flow was launched, so it knows how to
+  // finish (redirect vs. postMessage a parent iframe vs. postMessage+close a
+  // popup). It rides in the signed PKCE cookie so it survives the round-trip.
+  //   ?carrier=popup   -> interactive popup (fresh login / reconnect)
+  //   ?carrier=iframe  -> hidden iframe (silent re-mint)
+  //   (default)        -> redirect (full-page navigation)
+  const q = req.nextUrl.searchParams.get("carrier")
+  const carrier: MintCarrier = q === "popup" || q === "iframe" ? q : "redirect"
 
   const pkce = newPkce()
   const res = NextResponse.redirect(aadAuthUrl(cfg, pkce))
-  res.cookies.set(COOKIE_PKCE, encodePkceCookie(pkce, cfg.sessionSecret, silent), {
+  res.cookies.set(COOKIE_PKCE, encodePkceCookie(pkce, cfg.sessionSecret, carrier), {
     httpOnly: true,
     secure: cfg.scheme === "https",
     sameSite: "lax",

@@ -55,6 +55,7 @@ export default function Home() {
     isAuthenticated, isLoading, login, error, accessDenied,
     getUserName, getUserEmail, genieReady, geniePreparing,
     genieReconnecting, genieFrameKey,
+    genieMayNeedReconnect, reconnectGenie, notifyGenieFrameLoaded,
   } = useAuth();
 
   if (isLoading) {
@@ -122,15 +123,39 @@ export default function Home() {
     <>
       <Header who={who} />
       <div style={{ display: 'flex', flexDirection: 'column', height: 'calc(100vh - 56px)' }}>
-        <div
-          style={{
-            fontSize: 12.5, padding: '8px 18px', background: '#eefaf0',
-            borderBottom: '1px solid #c7ecd0', color: '#276b3a',
-          }}
-        >
-          <b>Signed in once.</b> Your MSAL sign-in established the Databricks session — the
-          native Genie iframe below loaded with no second prompt.
-        </div>
+        {genieMayNeedReconnect ? (
+          <div
+            style={{
+              fontSize: 12.5, padding: '8px 18px', background: '#fff7e6',
+              borderBottom: '1px solid #ffe1a8', color: '#8a5a00',
+              display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12,
+            }}
+          >
+            <span>
+              If Genie below is asking you to sign in, your Databricks session may have expired
+              in another window. Reconnect to restore it.
+            </span>
+            <button
+              onClick={() => reconnectGenie().catch(() => {})}
+              style={{
+                background: ACCENT, color: '#fff', border: 'none', padding: '6px 14px',
+                borderRadius: 6, fontWeight: 600, fontSize: 12.5, cursor: 'pointer', flex: '0 0 auto',
+              }}
+            >
+              Reconnect Genie
+            </button>
+          </div>
+        ) : (
+          <div
+            style={{
+              fontSize: 12.5, padding: '8px 18px', background: '#eefaf0',
+              borderBottom: '1px solid #c7ecd0', color: '#276b3a',
+            }}
+          >
+            <b>Signed in once.</b> Your MSAL sign-in established the Databricks session — the
+            native Genie iframe below loaded with no second prompt.
+          </div>
+        )}
         <div style={{ flex: 1, display: 'flex', padding: '14px 18px 18px', minHeight: 0 }}>
           <div
             style={{
@@ -142,6 +167,7 @@ export default function Home() {
               key={genieFrameKey}
               src={genieEmbedUrl()}
               allow="clipboard-write"
+              onLoad={() => notifyGenieFrameLoaded()}
               style={{ border: 'none', width: '100%', height: '100%' }}
             />
             {genieReconnecting && (

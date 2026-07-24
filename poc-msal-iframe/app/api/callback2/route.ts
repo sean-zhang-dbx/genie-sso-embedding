@@ -1,15 +1,22 @@
-// GET /api/callback2 — OAuth redirect landing. Exchanges the auth code for a
-// token, resolves identity via SCIM, sets the signed dbx_session cookie, then
-// either sends the browser back to the app (normal mode) or posts a completion
-// message to the parent window (silent re-mint mode, run in a hidden iframe).
+// GET /api/callback2 — the OAuth redirect_uri landing. This is the registered
+// redirect URL of the Databricks custom OAuth app, so the flow always ends HERE,
+// on our own origin, regardless of how it was launched. That is what lets us
+// finish deterministically (no cross-origin guessing, no timers).
 //
-// Ported from the Python library's `/callback2` route. `DBX_REDIRECT_URI` must
-// point here (…/api/callback2) AND match the registered OAuth integration.
+// It exchanges the auth code for a token, resolves identity via SCIM, sets the
+// signed dbx_session cookie, then finishes according to how the flow was carried
+// (see MintCarrier):
+//   - redirect: send the browser back to the app
+//   - iframe:   render a page that postMessages window.parent (silent re-mint)
+//   - popup:    render a page that postMessages window.opener, then self-closes
+//
+// `DBX_REDIRECT_URI` must point here (…/api/callback2) AND match the registered
+// OAuth integration.
 
 import { NextRequest, NextResponse } from "next/server"
 import {
   loadConfig, isConfigured, exchangeCodeForToken, resolveIdentity,
-  decodePkceCookie, encodeSession, silentCompletionHtml,
+  decodePkceCookie, encodeSession, mintCompletionHtml,
   COOKIE_PKCE, COOKIE_SESSION, SESSION_MAX_AGE_SEC,
 } from "../../../lib/genieSso"
 
@@ -19,10 +26,10 @@ export const dynamic = "force-dynamic"
 // Where to send the user after the cookie is planted (the app root by default).
 const SUCCESS_REDIRECT = process.env.DBX_SUCCESS_REDIRECT || "/"
 
-// Silent-mode responses render a tiny page that postMessages the parent. We
-// always clear the PKCE cookie on these too.
-function silentResponse(req: NextRequest, ok: boolean, detail = "") {
-  const html = silentCompletionHtml(ok, req.nextUrl.origin, detail)
+// Completion page for the iframe/popup carriers: signals the opener/parent and
+// (for a popup) closes itself. Always clears the one-time PKCE cookie.
+function completionResponse(req: NextRequest, ok: boolean, detail = "") {
+  const html = mintCompletionHtml(ok, req.nextUrl.origin, detail)
   const res = new NextResponse(html, {
     status: 200,
     headers: { "Content-Type": "text/html; charset=utf-8" },
@@ -43,11 +50,11 @@ export async function GET(req: NextRequest) {
   const cfg = loadConfig()
   const params = req.nextUrl.searchParams
   const pkce = decodePkceCookie(req.cookies.get(COOKIE_PKCE)?.value, cfg.sessionSecret)
-  // Trust the signed cookie for whether this is a silent (hidden-iframe) mint.
-  const silent = pkce?.silent === true
+  const carrier = pkce?.carrier ?? "redirect"
+  const usesCompletionPage = carrier === "iframe" || carrier === "popup"
 
   const fail = (msg: string) =>
-    silent ? silentResponse(req, false, msg) : redirectFail(req, msg)
+    usesCompletionPage ? completionResponse(req, false, msg) : redirectFail(req, msg)
 
   if (!isConfigured(cfg)) return fail("not_configured")
 
@@ -73,8 +80,8 @@ export async function GET(req: NextRequest) {
   // Success: set the signed app-side session marker. (The actual Databricks
   // workspace cookie was planted on the databricks.net domain during /aad/auth.)
   const sessionCookie = encodeSession({ email, ts: Date.now() }, cfg.sessionSecret)
-  const res = silent
-    ? silentResponse(req, true)
+  const res = usesCompletionPage
+    ? completionResponse(req, true)
     : NextResponse.redirect(new URL(SUCCESS_REDIRECT, req.url))
   res.cookies.set(COOKIE_PKCE, "", { path: "/", maxAge: 0 })
   res.cookies.set(COOKIE_SESSION, sessionCookie, {

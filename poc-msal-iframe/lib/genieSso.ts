@@ -116,20 +116,27 @@ export function newPkce(): Pkce {
   return { state, verifier, challenge }
 }
 
-/** The signed PKCE cookie value carrying {state, verifier} through the redirect.
- *  `silent` records whether this mint was started in a hidden iframe, so the
- *  callback knows to postMessage the parent instead of issuing a redirect. */
-export function encodePkceCookie(pkce: Pkce, secret: string, silent = false): string {
-  return encodeSession({ state: pkce.state, verifier: pkce.verifier, silent }, secret)
+// How the mint flow is being carried, which tells /api/callback2 how to finish:
+//   - "redirect": full-page navigation -> redirect the browser back to the app
+//   - "iframe":   hidden iframe (silent re-mint) -> postMessage window.parent
+//   - "popup":    interactive popup -> postMessage window.opener, then close
+export type MintCarrier = "redirect" | "iframe" | "popup"
+
+/** The signed PKCE cookie value carrying {state, verifier, carrier} through the
+ *  flow, so the callback knows how it was launched and how to finish. */
+export function encodePkceCookie(pkce: Pkce, secret: string, carrier: MintCarrier = "redirect"): string {
+  return encodeSession({ state: pkce.state, verifier: pkce.verifier, carrier }, secret)
 }
 
 export function decodePkceCookie(
   cookie: string | undefined,
   secret: string,
-): { state: string; verifier: string; silent: boolean } | null {
+): { state: string; verifier: string; carrier: MintCarrier } | null {
   const d = decodeSession(cookie, secret)
   if (!d || typeof d.state !== "string" || typeof d.verifier !== "string") return null
-  return { state: d.state, verifier: d.verifier, silent: d.silent === true }
+  const carrier: MintCarrier =
+    d.carrier === "iframe" || d.carrier === "popup" ? d.carrier : "redirect"
+  return { state: d.state, verifier: d.verifier, carrier }
 }
 
 // ---- The /aad/auth redirect URL (mirrors _login in the Python lib) ---------
@@ -186,19 +193,39 @@ export async function resolveIdentity(cfg: GenieSsoConfig, accessToken: string):
   return data.userName || null
 }
 
-// The message type the silent-completion page posts to the parent window.
+// The message type the completion page posts back to the app window.
 export const GENIE_MINT_MESSAGE = "genie-sso:mint-complete"
 
-/** HTML for the silent-mode callback. Rendered inside the hidden re-mint iframe;
- *  it posts the outcome to the parent window and does nothing visible. The
- *  parent listens for GENIE_MINT_MESSAGE. targetOrigin is the app's own origin,
- *  so the message never leaks cross-origin. */
-export function silentCompletionHtml(ok: boolean, origin: string, detail = ""): string {
+/** HTML for the OAuth completion callback, rendered on OUR origin at the end of
+ *  the mint flow (the OAuth redirect_uri lands here). Because it is same-origin
+ *  with the app, it can signal the opener/parent deterministically and close
+ *  itself — no cross-origin guessing, no timers.
+ *
+ *  It handles BOTH carriers:
+ *   - popup:        posts to window.opener, then window.close()
+ *   - hidden iframe: posts to window.parent (legacy silent re-mint path)
+ *
+ *  The parent/opener listens for GENIE_MINT_MESSAGE and reloads the iframe. */
+export function mintCompletionHtml(ok: boolean, origin: string, detail = ""): string {
   const payload = JSON.stringify({ type: GENIE_MINT_MESSAGE, ok, detail })
+  const target = JSON.stringify(origin)
   // origin and payload are server-controlled (config + booleans), not user input.
-  return `<!DOCTYPE html><html><head><meta charset="utf-8"></head><body>
+  return `<!DOCTYPE html><html><head><meta charset="utf-8"><title>Connecting…</title></head>
+<body style="font-family:-apple-system,Segoe UI,Roboto,sans-serif;color:#1B3139;padding:28px">
+<p>Connected. You can close this window.</p>
 <script>
-  try { window.parent.postMessage(${payload}, ${JSON.stringify(origin)}); } catch (e) {}
+  try {
+    var msg = ${payload}, target = ${target};
+    if (window.opener && window.opener !== window) {
+      window.opener.postMessage(msg, target);   // popup path
+      window.close();
+    } else if (window.parent && window.parent !== window) {
+      window.parent.postMessage(msg, target);    // hidden-iframe path
+    }
+  } catch (e) {}
 </script>
 </body></html>`
 }
+
+/** @deprecated use mintCompletionHtml — kept as an alias for the hidden-iframe path. */
+export const silentCompletionHtml = mintCompletionHtml

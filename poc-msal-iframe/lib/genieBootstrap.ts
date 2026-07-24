@@ -31,10 +31,31 @@ export const GENIE_CONFIG = {
   SPACE_ID: process.env.NEXT_PUBLIC_GENIE_SPACE_ID!, // the Genie space id
 }
 
-export type MintMode = "server" | "popup"
+// Three selectable approaches, chosen via NEXT_PUBLIC_MINT_MODE:
+//
+//   "server"      (default) — full-page OAuth redirect through /api/dbx-login.
+//                  Seamless, deterministic. REQUIRES a Databricks account-admin
+//                  to register a custom OAuth app.
+//
+//   "oauth-popup" — the same server-side OAuth flow, but carried in a popup so it
+//                  can show interactive consent and never navigates the main
+//                  window. Deterministic close (lands on /api/callback2, posts
+//                  back, self-closes). Also REQUIRES the OAuth app.
+//
+//   "client"      — no OAuth app at all: a popup hits the workspace /aad/auth
+//                  pointing straight at the Genie embed page. Works with NO
+//                  account-admin setup, but the popup ends cross-origin so its
+//                  close is best-effort (focus/close heuristic), not deterministic.
+export type MintMode = "server" | "oauth-popup" | "client"
 
 export function mintMode(): MintMode {
-  return (process.env.NEXT_PUBLIC_MINT_MODE as MintMode) || "server"
+  const m = process.env.NEXT_PUBLIC_MINT_MODE
+  return m === "oauth-popup" || m === "client" ? m : "server"
+}
+
+// True when the selected mode needs the Databricks OAuth app registration.
+export function mintNeedsOAuthApp(): boolean {
+  return mintMode() !== "client"
 }
 
 // The embeddable Genie surface. IMPORTANT: use /embed/genie/rooms/... — it
@@ -67,10 +88,63 @@ export function startServerMint(): void {
   window.location.assign("/api/dbx-login")
 }
 
-// The message the silent callback posts back to us (mirror of GENIE_MINT_MESSAGE
-// in genieSso.ts — duplicated here to avoid importing a server module into the
-// client bundle).
+// The message /api/callback2 posts back to us on completion (mirror of
+// GENIE_MINT_MESSAGE in genieSso.ts — duplicated here to avoid importing a
+// server module into the client bundle).
 const GENIE_MINT_MESSAGE = "genie-sso:mint-complete"
+
+// Establish the Databricks session in an INTERACTIVE POPUP running the full
+// OAuth flow (carrier=popup). Because the OAuth redirect_uri lands the popup back
+// on /api/callback2 (our origin), that page postMessages us and self-closes, so
+// this resolves DETERMINISTICALLY the moment the flow completes — no 6s timer, no
+// cross-origin URL guessing. The popup can also display any interactive consent /
+// group-select step (unlike a hidden iframe, which X-Frame-Options blocks), so it
+// handles both fresh login and reconnect after a hard logout.
+//
+// Returns true if the session was established, false if the user closed the popup
+// or it timed out. `maxWaitMs` is only a safety cap for an abandoned popup.
+export function mintViaPopup(maxWaitMs = 180000): Promise<boolean> {
+  return new Promise((resolve) => {
+    if (typeof window === "undefined") return resolve(false)
+
+    const w = 480, h = 680
+    const left = (screen.width - w) / 2
+    const top = (screen.height - h) / 2
+    const popup = window.open(
+      "/api/dbx-login?carrier=popup",
+      "dbxauth",
+      `popup=yes,width=${w},height=${h},left=${left},top=${top},menubar=no,toolbar=no,location=no,status=no`,
+    )
+
+    let done = false
+    let closeTimer: ReturnType<typeof setInterval>
+    let capTimer: ReturnType<typeof setTimeout>
+
+    const onMessage = (e: MessageEvent) => {
+      if (e.origin !== window.location.origin) return
+      if (!e.data || e.data.type !== GENIE_MINT_MESSAGE) return
+      finish(Boolean(e.data.ok))
+    }
+
+    const finish = (ok: boolean) => {
+      if (done) return
+      done = true
+      clearInterval(closeTimer)
+      clearTimeout(capTimer)
+      window.removeEventListener("message", onMessage)
+      try { if (popup && !popup.closed) popup.close() } catch { /* cross-origin */ }
+      try { window.focus() } catch { /* ignore */ }
+      resolve(ok)
+    }
+
+    // Primary signal: /api/callback2 posted completion (deterministic).
+    window.addEventListener("message", onMessage)
+    // Backup: user closed the popup themselves before completing.
+    closeTimer = setInterval(() => { if (!popup || popup.closed) finish(false) }, 600)
+    // Safety cap for an abandoned popup only.
+    capTimer = setTimeout(() => finish(false), maxWaitMs)
+  })
+}
 
 // Re-establish the Databricks session WITHOUT a visible redirect or popup, by
 // running the mint chain inside a hidden iframe. Works only when Entra can
@@ -86,7 +160,7 @@ export function silentRemint(timeoutMs = 8000): Promise<boolean> {
     const frame = document.createElement("iframe")
     frame.style.display = "none"
     frame.setAttribute("aria-hidden", "true")
-    frame.src = "/api/dbx-login?silent=1"
+    frame.src = "/api/dbx-login?carrier=iframe"
 
     let done = false
     const cleanup = () => {
@@ -116,53 +190,57 @@ export function silentRemint(timeoutMs = 8000): Promise<boolean> {
   })
 }
 
-// ---- popup mode (original client-only mint; no server, no OAuth app) --------
-
-function aadAuthUrl(): string {
+// ---- client mode: no OAuth app required ------------------------------------
+// A popup hits the workspace /aad/auth pointing directly at the Genie embed page
+// (no client_id, no OAuth). The workspace cookie is planted during the /aad/auth
+// hop. Because the popup ends on the Databricks embed page (cross-origin), we
+// cannot read its URL or receive a postMessage, so completion is BEST-EFFORT:
+// we resolve when the app window regains focus (the user returning) or the popup
+// closes. This is the inherent tradeoff of not using the OAuth app — no
+// deterministic close. Kept as a selectable mode for deployments that cannot get
+// an account-admin OAuth registration.
+function clientAadAuthUrl(): string {
   const relative = `/embed/genie/rooms/${GENIE_CONFIG.SPACE_ID}?o=${GENIE_CONFIG.ORG_ID}`
   const nextB64 = btoa(relative)
   return `https://${GENIE_CONFIG.WS_HOST}/aad/auth?next_url=${encodeURIComponent(nextB64)}`
 }
 
-// Open a brief top-level popup to establish the Databricks session, then close
-// it. Resolves once the popup closes or after `autocloseMs`. The caller reveals
-// the iframe afterward.
-export function bootstrapDatabricksSessionPopup(autocloseMs = 6000): Promise<void> {
+export function mintViaClientPopup(maxWaitMs = 180000): Promise<boolean> {
   return new Promise((resolve) => {
-    const w = 480
-    const h = 640
+    if (typeof window === "undefined") return resolve(false)
+    const w = 480, h = 680
     const left = (screen.width - w) / 2
     const top = (screen.height - h) / 2
     const popup = window.open(
-      aadAuthUrl(),
+      clientAadAuthUrl(),
       "dbxauth",
       `popup=yes,width=${w},height=${h},left=${left},top=${top},menubar=no,toolbar=no,location=no,status=no`,
     )
 
     let done = false
-    const finish = () => {
+    let armed = false
+    let armTimer: ReturnType<typeof setTimeout>
+    let capTimer: ReturnType<typeof setTimeout>
+    let closeTimer: ReturnType<typeof setInterval>
+    const onAppFocus = () => { if (armed) finish(true) }
+
+    const finish = (ok: boolean) => {
       if (done) return
       done = true
-      try {
-        if (popup && !popup.closed) popup.close()
-      } catch {
-        /* cross-origin close guard */
-      }
-      resolve()
+      clearInterval(closeTimer)
+      clearTimeout(armTimer)
+      clearTimeout(capTimer)
+      window.removeEventListener("focus", onAppFocus)
+      try { if (popup && !popup.closed) popup.close() } catch { /* cross-origin */ }
+      try { window.focus() } catch { /* ignore */ }
+      resolve(ok)
     }
 
-    // Poll for the popup closing itself after the silent redirect completes.
-    const timer = setInterval(() => {
-      if (popup && popup.closed) {
-        clearInterval(timer)
-        finish()
-      }
-    }, 500)
-
-    // Safety net: close and proceed after the timeout regardless.
-    setTimeout(() => {
-      clearInterval(timer)
-      finish()
-    }, autocloseMs)
+    // Best-effort completion: user returns to the app window (armed after a short
+    // delay so the opening gesture doesn't fire it), or the popup is closed.
+    armTimer = setTimeout(() => { armed = true }, 1500)
+    window.addEventListener("focus", onAppFocus)
+    closeTimer = setInterval(() => { if (!popup || popup.closed) finish(true) }, 600)
+    capTimer = setTimeout(() => finish(false), maxWaitMs)
   })
 }

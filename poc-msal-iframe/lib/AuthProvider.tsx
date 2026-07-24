@@ -8,7 +8,8 @@ import {
   genieStatus,
   startServerMint,
   silentRemint,
-  bootstrapDatabricksSessionPopup,
+  mintViaPopup,
+  mintViaClientPopup,
 } from './genieBootstrap';
 
 // Mirrors GSK's AuthProvider. The additions for the iframe PoC are:
@@ -58,6 +59,9 @@ interface AuthContextType {
   geniePreparing: boolean;    // initial bootstrap in progress
   genieReconnecting: boolean; // silent re-mint / recovery in progress (show overlay)
   genieFrameKey: number;      // bump to force the Genie iframe to reload
+  genieMayNeedReconnect: boolean; // popup mode: user returned to tab; offer a Reconnect action
+  reconnectGenie: () => Promise<void>; // popup mode: re-run the mint on user click
+  notifyGenieFrameLoaded: () => void;  // page calls this on each iframe load event
 }
 
 const AuthContext = createContext<AuthContextType | undefined>(undefined);
@@ -91,8 +95,26 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
   const [geniePreparing, setGeniePreparing] = useState(false);
   const [genieReconnecting, setGenieReconnecting] = useState(false);
   const [genieFrameKey, setGenieFrameKey] = useState(0);
+  const [genieMayNeedReconnect, setGenieMayNeedReconnect] = useState(false);
   // Guards against overlapping recovery runs (focus can fire in bursts).
   const recoveringRef = useRef(false);
+  // Tracks iframe load events. The first load is the legitimate Genie render.
+  // A later load we did NOT trigger ourselves means the embed navigated (almost
+  // always a bounce to Databricks' login after the session died) -> offer reconnect.
+  const frameLoadCountRef = useRef(0);
+  const expectedReloadRef = useRef(false);
+
+  // Called by the page on every iframe `onload`. Detects the dead-session bounce
+  // proactively so the Reconnect banner appears without waiting for a tab refocus.
+  const notifyGenieFrameLoaded = useCallback(() => {
+    frameLoadCountRef.current += 1;
+    if (frameLoadCountRef.current === 1) return;      // initial Genie load, fine
+    if (expectedReloadRef.current) {                  // our own deliberate reload
+      expectedReloadRef.current = false;
+      return;
+    }
+    if (mintMode() !== 'server') setGenieMayNeedReconnect(true);
+  }, []);
 
   const getUserEmail = (): string | null => {
     if (user?.email) return user.email;
@@ -131,8 +153,10 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
     try {
       setGeniePreparing(true);
 
-      if (mintMode() === 'server') {
-        // Server mode: is the Databricks cookie already minted this session?
+      const mode = mintMode();
+
+      if (mode === 'server') {
+        // Full-page OAuth redirect. Is the cookie already minted this session?
         const status = await genieStatus();
         if (status.ready) {
           setGenieReady(true);
@@ -145,8 +169,17 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
         return; // navigation in flight; nothing more to do here
       }
 
-      // Popup mode: original client-only bootstrap.
-      await bootstrapDatabricksSessionPopup();
+      if (mode === 'oauth-popup') {
+        // OAuth flow carried in a popup. Resolves deterministically when
+        // /api/callback2 (our origin) posts completion and self-closes.
+        await mintViaPopup();
+        setGenieReady(true);
+        return;
+      }
+
+      // mode === 'client': no OAuth app. Best-effort popup straight to the
+      // workspace /aad/auth -> embed page (ends cross-origin; best-effort close).
+      await mintViaClientPopup();
       setGenieReady(true);
     } catch (err) {
       console.error('Genie bootstrap failed:', err);
@@ -174,6 +207,7 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
         const ok = await silentRemint();
         if (ok) {
           // Cookie refreshed. Reload the iframe so a dead session is replaced.
+          expectedReloadRef.current = true;
           setGenieFrameKey((k) => k + 1);
         } else if (showOverlay) {
           // Silent path blocked (Entra session gone). Visible re-auth — this is
@@ -189,6 +223,30 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
     },
     [],
   );
+
+  // Popup-mode recovery (Gap 2 for popup mode). We cannot read the cross-origin
+  // iframe to know its Databricks session died, so the user clicks Reconnect and
+  // this re-runs the SAME interactive popup OAuth flow as fresh login. Because it
+  // ends on /api/callback2 (our origin), it resolves deterministically and closes
+  // itself — no timer, no cross-origin guessing. Handles the hard-logout consent
+  // step too, since the popup can show it.
+  const reconnectGenie = useCallback(async (): Promise<void> => {
+    if (recoveringRef.current) return;
+    recoveringRef.current = true;
+    setGenieReconnecting(true);
+    try {
+      // oauth-popup: deterministic OAuth popup. client: best-effort no-OAuth popup.
+      await (mintMode() === 'client' ? mintViaClientPopup() : mintViaPopup());
+      expectedReloadRef.current = true; // this reload is ours; don't re-flag reconnect
+      setGenieFrameKey((k) => k + 1);   // reload iframe against the refreshed cookie
+      setGenieMayNeedReconnect(false);
+    } catch (err) {
+      console.error('Genie reconnect failed:', err);
+    } finally {
+      recoveringRef.current = false;
+      setGenieReconnecting(false);
+    }
+  }, []);
 
   useEffect(() => {
     const initializeAuth = async () => {
@@ -269,13 +327,22 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
   }, [genieReady, recoverGenieSession]);
 
   // Gap 2 — cross-window Databricks logout. When the user returns to the app tab
-  // (the exact moment described: they log out of Databricks elsewhere, then come
-  // back), re-establish the session silently behind an overlay and reload the
-  // iframe. The user never has to touch Databricks' in-iframe login button.
+  // (they log out of Databricks elsewhere, then come back), we recover the
+  // session so they never have to touch Databricks' in-iframe login button.
+  //   - server mode: silently re-mint behind an overlay and reload the iframe.
+  //   - popup mode: we cannot read the cross-origin iframe to know the session
+  //     died, so surface a Reconnect affordance the user clicks (a gesture also
+  //     satisfies popup-blocker rules); reconnectGenie() then re-mints + reloads.
   useEffect(() => {
     if (!genieReady) return;
     const onFocus = () => {
-      if (document.visibilityState === 'visible') recoverGenieSession(true);
+      if (document.visibilityState !== 'visible') return;
+      if (recoveringRef.current) return; // a reconnect is completing; don't re-flag
+      if (mintMode() === 'server') {
+        recoverGenieSession(true);
+      } else {
+        setGenieMayNeedReconnect(true);
+      }
     };
     window.addEventListener('focus', onFocus);
     document.addEventListener('visibilitychange', onFocus);
@@ -329,6 +396,7 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
       setAccessDenied(false);
       setGenieReady(false);
       setGenieReconnecting(false);
+      setGenieMayNeedReconnect(false);
     } catch (err) {
       console.error('Logout error:', err);
       setError(err instanceof Error ? err.message : 'Logout failed');
@@ -364,6 +432,9 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
     geniePreparing,
     genieReconnecting,
     genieFrameKey,
+    genieMayNeedReconnect,
+    reconnectGenie,
+    notifyGenieFrameLoaded,
   };
 
   return <AuthContext.Provider value={contextValue}>{children}</AuthContext.Provider>;
