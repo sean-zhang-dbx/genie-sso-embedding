@@ -98,6 +98,11 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
   const [genieMayNeedReconnect, setGenieMayNeedReconnect] = useState(false);
   // Guards against overlapping recovery runs (focus can fire in bursts).
   const recoveringRef = useRef(false);
+  // Set once we kick off the server-mode full-page redirect. window.location
+  // navigation is async, so without this latch prepareGenie re-fires on the next
+  // render and hammers /api/dbx-login (the redirect loop). Never cleared — the
+  // page is leaving.
+  const serverRedirectingRef = useRef(false);
   // Tracks iframe load events. The first load is the legitimate Genie render.
   // A later load we did NOT trigger ourselves means the embed navigated (almost
   // always a bounce to Databricks' login after the session died) -> offer reconnect.
@@ -149,7 +154,7 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
   // iframe loads without a second login. Silent because MSAL already
   // established the Entra session.
   const prepareGenie = useCallback(async (): Promise<void> => {
-    if (genieReady || geniePreparing) return;
+    if (genieReady || geniePreparing || serverRedirectingRef.current) return;
     try {
       setGeniePreparing(true);
 
@@ -162,9 +167,12 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
           setGenieReady(true);
           return;
         }
-        // Not yet — full-page redirect into the server mint chain. This
-        // navigates away; on return, initializeAuth() runs prepareGenie() again
-        // and genieStatus() now reports ready=true.
+        // Not yet — full-page redirect into the server mint chain. window.location
+        // navigation is async; latch first so a re-render can't re-fire this and
+        // hammer /api/dbx-login before the browser actually leaves the page.
+        // callback2 redirects back to "/", where prepareGenie runs once more and
+        // genieStatus() now reports ready=true.
+        serverRedirectingRef.current = true;
         startServerMint();
         return; // navigation in flight; nothing more to do here
       }
