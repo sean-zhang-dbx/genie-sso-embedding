@@ -26,10 +26,30 @@ export const dynamic = "force-dynamic"
 // Where to send the user after the cookie is planted (the app root by default).
 const SUCCESS_REDIRECT = process.env.DBX_SUCCESS_REDIRECT || "/"
 
+// The app's PUBLIC origin. Behind Azure App Service (and most proxies) req.url
+// reflects the INTERNAL host:port (e.g. https://<container-id>:8080), so building
+// redirects from it leaks that unreachable address to the browser (blank :8080
+// page). Derive the real external origin instead, in priority order:
+//   1) PUBLIC_ORIGIN env (explicit override)
+//   2) the origin of DBX_REDIRECT_URI (already the public …/api/callback2 URL)
+//   3) X-Forwarded-Proto + X-Forwarded-Host (what the proxy actually received)
+//   4) req.nextUrl.origin (last resort; local dev)
+function publicOrigin(req: NextRequest): string {
+  if (process.env.PUBLIC_ORIGIN) return process.env.PUBLIC_ORIGIN.replace(/\/$/, "")
+  const redir = process.env.DBX_REDIRECT_URI
+  if (redir) { try { return new URL(redir).origin } catch { /* fall through */ } }
+  const xfHost = req.headers.get("x-forwarded-host")
+  if (xfHost) {
+    const proto = req.headers.get("x-forwarded-proto") || "https"
+    return `${proto}://${xfHost.split(",")[0].trim()}`
+  }
+  return req.nextUrl.origin
+}
+
 // Completion page for the iframe/popup carriers: signals the opener/parent and
 // (for a popup) closes itself. Always clears the one-time PKCE cookie.
 function completionResponse(req: NextRequest, ok: boolean, detail = "") {
-  const html = mintCompletionHtml(ok, req.nextUrl.origin, detail)
+  const html = mintCompletionHtml(ok, publicOrigin(req), detail)
   const res = new NextResponse(html, {
     status: 200,
     headers: { "Content-Type": "text/html; charset=utf-8" },
@@ -39,7 +59,7 @@ function completionResponse(req: NextRequest, ok: boolean, detail = "") {
 }
 
 function redirectFail(req: NextRequest, msg: string) {
-  const url = new URL(SUCCESS_REDIRECT, req.url)
+  const url = new URL(SUCCESS_REDIRECT, publicOrigin(req))
   url.searchParams.set("dbx_error", msg)
   const res = NextResponse.redirect(url)
   res.cookies.set(COOKIE_PKCE, "", { path: "/", maxAge: 0 })
@@ -82,7 +102,7 @@ export async function GET(req: NextRequest) {
   const sessionCookie = encodeSession({ email, ts: Date.now() }, cfg.sessionSecret)
   const res = usesCompletionPage
     ? completionResponse(req, true)
-    : NextResponse.redirect(new URL(SUCCESS_REDIRECT, req.url))
+    : NextResponse.redirect(new URL(SUCCESS_REDIRECT, publicOrigin(req)))
   res.cookies.set(COOKIE_PKCE, "", { path: "/", maxAge: 0 })
   res.cookies.set(COOKIE_SESSION, sessionCookie, {
     httpOnly: true,
