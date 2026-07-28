@@ -144,7 +144,7 @@ The Python reference app (Option A) uses **only** the Databricks OAuth integrati
 MSAL-based app (like `poc-msal-iframe/`) uses **both**. This section covers the Databricks
 one.
 
-#### Option 1 — Account console UI (recommended for customers)
+#### Option 1 — Account console UI
 
 1. Open the **Azure Databricks account console** → **Settings → App connections**
    (`https://accounts.azuredatabricks.net/settings/app-integrations?account_id=<account-id>`).
@@ -183,7 +183,7 @@ curl -X POST \
 Both return `client_id` + `client_secret`. **The secret is only in this response** — it
 cannot be retrieved later; rotate (create a new secret) if lost.
 
-#### What each field means (to explain to a customer)
+#### What each field means
 
 | Field | Meaning |
 |---|---|
