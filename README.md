@@ -122,9 +122,53 @@ sequenceDiagram
 > the authorize step returns `invalid_client`. Sign-in host and embed host must be the same
 > workspace, on the account where the OAuth app is registered.
 
-### Register the OAuth app integration
+### Register the OAuth app integration — customer setup guide
+
+This is the account-admin step that makes Option A work. A customer sets up **their own**
+integration on **their** Databricks account (a client is only valid on the account it's
+registered on — you cannot reuse someone else's).
+
+#### First, the distinction that trips everyone up
+
+There are **two separate identity objects**, in two different systems. The customer likely
+needs both, and they are not the same thing:
+
+| | **Databricks OAuth app integration** (this section) | **Entra (Azure AD) app registration** |
+|---|---|---|
+| Lives in | Databricks **account console → App connections** | Azure **Entra → App registrations** |
+| Created by | Databricks **account admin** | Azure AD **app admin** |
+| Gives you | `client_id` + `client_secret` (`DBX_CLIENT_ID`/`DBX_CLIENT_SECRET`) | the MSAL `clientId` the browser signs into |
+| Purpose | mint the Databricks **session cookie** the iframe needs | app login + Microsoft Graph group check (MSAL apps only) |
+
+The Python reference app (Option A) uses **only** the Databricks OAuth integration. An
+MSAL-based app (like `poc-msal-iframe/`) uses **both**. This section covers the Databricks
+one.
+
+#### Option 1 — Account console UI (recommended for customers)
+
+1. Open the **Azure Databricks account console** → **Settings → App connections**
+   (`https://accounts.azuredatabricks.net/settings/app-integrations?account_id=<account-id>`).
+2. Click **Add connection**.
+3. **Name** it (e.g. `genie-sso-embedding`).
+4. **Redirect URLs**: add `https://<your-app-host>/callback2` — this must **exactly** match
+   the callback route your app serves. ⚠️ The Python app uses `/callback2`; the Next.js app
+   uses **`/api/callback2`**. A trailing-slash or path mismatch fails with a redirect error.
+5. **Scopes**: `iam.current-user:read` (identity only → benign consent screen). Add
+   `offline_access` only if you need refresh tokens.
+6. **Generate a client secret** (confidential client). ⚠️ **Copy it immediately — Databricks
+   will never show it again.** Store it as the app's `DBX_CLIENT_SECRET`.
+7. Copy the **Client ID** → the app's `DBX_CLIENT_ID`.
+
+#### Option 2 — CLI or REST
 
 ```bash
+# CLI (account-admin profile)
+databricks account custom-app-integration create --confidential \
+  --json '{"name":"genie-sso-embedding",
+           "redirect_urls":["https://<your-app-host>/callback2"],
+           "scopes":["iam.current-user:read","offline_access"]}'
+
+# …or raw REST
 curl -X POST \
   https://accounts.<cloud>.databricks.com/api/2.0/accounts/{account_id}/oauth2/custom-app-integrations \
   -H "Authorization: Bearer <account-admin-token>" \
@@ -136,8 +180,27 @@ curl -X POST \
       }'
 ```
 
-The response's `client_id` / `client_secret` become `DBX_CLIENT_ID` / `DBX_CLIENT_SECRET`;
-the redirect URL must match `SSO_REDIRECT_URI` exactly.
+Both return `client_id` + `client_secret`. **The secret is only in this response** — it
+cannot be retrieved later; rotate (create a new secret) if lost.
+
+#### What each field means (to explain to a customer)
+
+| Field | Meaning |
+|---|---|
+| `client_id` (a.k.a. `integration_id`) | Public identifier the app sends to `/oidc/v1/authorize`. → `DBX_CLIENT_ID` |
+| `client_secret` | Confidential credential used at `/oidc/v1/token`. → `DBX_CLIENT_SECRET`. Server-side only, unrecoverable after creation. |
+| `redirect_urls` | Allow-list of callback endpoints. The `redirect_uri` in each request must match one exactly. Add one per deployed host. |
+| `scopes` | `iam.current-user:read` = identify the user via SCIM `/Me`. The iframe rides the session cookie, not this token, so no broad scopes are needed. |
+| `confidential` | `true` = has a secret (server-side app). SPAs without a backend would be non-confidential + PKCE-only. |
+| token/refresh/session TTLs | How long tokens and the session stay valid (defaults: 60 min / 7 days / 90 days). |
+
+The `client_id` / `client_secret` become `DBX_CLIENT_ID` / `DBX_CLIENT_SECRET` (and
+`SSO_REDIRECT_URI` for the Python app / `DBX_REDIRECT_URI` for the Next.js app) — the
+redirect URI must match a registered `redirect_urls` entry exactly.
+
+> Don't forget the [prerequisites](#prerequisites-both-options): the workspace embedding
+> policy must allow the app's domain, and the browser must allow third-party cookies — or
+> the iframe still forces a second login no matter how the OAuth app is configured.
 
 ### Run the Python app (Option A reference implementation)
 
