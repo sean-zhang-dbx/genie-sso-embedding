@@ -1,6 +1,7 @@
 'use client';
 
 import React from 'react';
+import Link from 'next/link';
 import { useAuth } from '../lib/AuthProvider';
 import { genieEmbedUrl } from '../lib/genieBootstrap';
 
@@ -20,6 +21,15 @@ function Header({ who }: { who?: string | null }) {
         CONTOSO <span style={{ opacity: 0.55, fontWeight: 400 }}>| Analytics Portal</span>
       </div>
       <div style={{ display: 'flex', alignItems: 'center', gap: 16 }}>
+        <Link
+          href="/other"
+          style={{
+            color: '#fff', textDecoration: 'none', fontSize: 13, opacity: 0.9,
+            border: '1px solid rgba(255,255,255,.4)', padding: '6px 14px', borderRadius: 6,
+          }}
+        >
+          Other view →
+        </Link>
         {who && <span style={{ fontSize: 13, opacity: 0.9 }}>{who}</span>}
         <button
           onClick={() => logout()}

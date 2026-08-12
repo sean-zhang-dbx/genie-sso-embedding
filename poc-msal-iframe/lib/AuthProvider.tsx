@@ -1,8 +1,8 @@
 'use client';
 
 import React, { createContext, useContext, useEffect, useState, ReactNode, useCallback, useRef } from 'react';
-import { AccountInfo, EventType, EventMessage } from '@azure/msal-browser';
-import { initializeMsal, authHelpers, msalInstance } from './msalAuthSetup';
+import { AccountInfo } from '@azure/msal-browser';
+import { initializeMsal, authHelpers } from './msalAuthSetup';
 import {
   mintMode,
   genieStatus,
@@ -109,17 +109,8 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
   const frameLoadCountRef = useRef(0);
   const expectedReloadRef = useRef(false);
 
-  // Called by the page on every iframe `onload`. Detects the dead-session bounce
-  // proactively so the Reconnect banner appears without waiting for a tab refocus.
-  const notifyGenieFrameLoaded = useCallback(() => {
-    frameLoadCountRef.current += 1;
-    if (frameLoadCountRef.current === 1) return;      // initial Genie load, fine
-    if (expectedReloadRef.current) {                  // our own deliberate reload
-      expectedReloadRef.current = false;
-      return;
-    }
-    if (mintMode() !== 'server') setGenieMayNeedReconnect(true);
-  }, []);
+  // notifyGenieFrameLoaded is defined after recoverGenieSession (below) because
+  // it now triggers recovery on the real dead-session signal.
 
   const getUserEmail = (): string | null => {
     if (user?.email) return user.email;
@@ -199,28 +190,43 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
     }
   }, [genieReady, geniePreparing]);
 
-  // Keep the Databricks session alive / recover it without the user ever seeing
-  // Databricks' in-iframe login. Runs a hidden silent re-mint:
-  //   - success  -> reload the iframe so it picks up the refreshed cookie
-  //   - failure  -> Entra can't go silent either; fall back to a visible re-auth
-  // `showOverlay` covers the iframe during focus-triggered recovery (Gap 2). The
-  // proactive MSAL-renewal path (Gap 1) runs without an overlay.
+  // Recover the Databricks session without the user ever seeing Databricks'
+  // in-iframe login — and, critically, WITHOUT ever navigating the top window.
+  //
+  //   force=false (proactive triggers, e.g. window focus): first ask
+  //     /api/genie-status. If the app-side session marker is still valid we do
+  //     NOTHING. This is the fix for the re-mint storm — a healthy session is
+  //     never re-minted just because the tab regained focus.
+  //   force=true (reactive trigger: the iframe actually bounced to Databricks'
+  //     login): the embed itself told us the session is dead, so skip the status
+  //     gate (the app-side marker can still look valid) and re-mint.
+  //
+  // On silent-remint success we reload ONLY the iframe. On failure we surface the
+  // Reconnect banner (a user click then re-mints via popup with the current route
+  // preserved). We NEVER full-page redirect — that top-window redirect to "/" was
+  // what randomly threw the user back to the Genie view from other pages.
   const recoverGenieSession = useCallback(
-    async (showOverlay: boolean): Promise<void> => {
+    async (showOverlay: boolean, force = false): Promise<void> => {
       if (mintMode() !== 'server') return;      // popup mode has no silent path
-      if (recoveringRef.current) return;         // de-dupe bursts of focus events
+      if (recoveringRef.current) return;         // de-dupe bursts of events
       recoveringRef.current = true;
-      if (showOverlay) setGenieReconnecting(true);
       try {
+        if (!force) {
+          // Gate: don't re-mint a session that is still valid.
+          const status = await genieStatus();
+          if (status.ready) return;
+        }
+        if (showOverlay) setGenieReconnecting(true);
         const ok = await silentRemint();
         if (ok) {
           // Cookie refreshed. Reload the iframe so a dead session is replaced.
           expectedReloadRef.current = true;
           setGenieFrameKey((k) => k + 1);
-        } else if (showOverlay) {
-          // Silent path blocked (Entra session gone). Visible re-auth — this is
-          // a genuine full re-login, not just the Databricks cookie.
-          startServerMint();
+          setGenieMayNeedReconnect(false);
+        } else {
+          // Silent path blocked (Entra also needs interaction). Offer a click-to-
+          // reconnect (popup) instead of yanking the top window to "/".
+          setGenieMayNeedReconnect(true);
         }
       } catch (err) {
         console.error('Genie session recovery failed:', err);
@@ -231,6 +237,26 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
     },
     [],
   );
+
+  // Called by the page on every iframe `onload`. A 2nd+ load we did not initiate
+  // ourselves means the embed navigated — almost always a bounce to Databricks'
+  // login because the session died. THIS is the real recovery signal: in server
+  // mode trigger a forced silent re-mint (force=true bypasses the status gate,
+  // since the app-side marker can still look valid). Popup modes can't silently
+  // re-mint, so they surface the Reconnect banner for a user click.
+  const notifyGenieFrameLoaded = useCallback(() => {
+    frameLoadCountRef.current += 1;
+    if (frameLoadCountRef.current === 1) return;      // initial Genie load, fine
+    if (expectedReloadRef.current) {                  // our own deliberate reload
+      expectedReloadRef.current = false;
+      return;
+    }
+    if (mintMode() === 'server') {
+      recoverGenieSession(true, /* force */ true);
+    } else {
+      setGenieMayNeedReconnect(true);
+    }
+  }, [recoverGenieSession]);
 
   // Popup-mode recovery (Gap 2 for popup mode). We cannot read the cross-origin
   // iframe to know its Databricks session died, so the user clicks Reconnect and
@@ -315,29 +341,19 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
     if (isAuthenticated && hasGroupAccess) prepareGenie();
   }, [isAuthenticated, hasGroupAccess, prepareGenie]);
 
-  // Gap 1 — token refresh. MSAL raises ACQUIRE_TOKEN_SUCCESS on every silent
-  // Entra token renewal. Piggyback on it to refresh the Databricks session on
-  // the same cadence, so the cookie never drifts out of sync with the app
-  // session. No overlay: this is proactive upkeep, not a user-visible recovery.
-  useEffect(() => {
-    if (!genieReady) return;
-    const callbackId = msalInstance.addEventCallback((message: EventMessage) => {
-      if (
-        message.eventType === EventType.ACQUIRE_TOKEN_SUCCESS ||
-        message.eventType === EventType.SSO_SILENT_SUCCESS
-      ) {
-        recoverGenieSession(false);
-      }
-    });
-    return () => {
-      if (callbackId) msalInstance.removeEventCallback(callbackId);
-    };
-  }, [genieReady, recoverGenieSession]);
+  // (Removed) Gap 1 — a proactive re-mint on every MSAL token renewal
+  // (ACQUIRE_TOKEN_SUCCESS / SSO_SILENT_SUCCESS). In a real multi-view app that
+  // calls getAccessToken() for its own APIs, that event fires constantly and was
+  // a primary source of the re-mint storm. The Databricks cookie has its own
+  // lifetime; we now recover reactively when the iframe actually bounces to login
+  // (see notifyGenieFrameLoaded), not on every token renewal.
 
-  // Gap 2 — cross-window Databricks logout. When the user returns to the app tab
-  // (they log out of Databricks elsewhere, then come back), we recover the
-  // session so they never have to touch Databricks' in-iframe login button.
-  //   - server mode: silently re-mint behind an overlay and reload the iframe.
+  // Gap 2 — cross-window Databricks logout, as a light safety net only. When the
+  // user returns to the app tab we re-check the session, but this is now GATED:
+  //   - server mode: recoverGenieSession(false) asks /api/genie-status first and
+  //     no-ops if the session is still valid, so ordinary focus churn (clicking
+  //     into/out of the iframe, app-switching) does NOT trigger a re-mint. It can
+  //     never navigate the top window; worst case it shows the Reconnect banner.
   //   - popup mode: we cannot read the cross-origin iframe to know the session
   //     died, so surface a Reconnect affordance the user clicks (a gesture also
   //     satisfies popup-blocker rules); reconnectGenie() then re-mints + reloads.
@@ -347,7 +363,7 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
       if (document.visibilityState !== 'visible') return;
       if (recoveringRef.current) return; // a reconnect is completing; don't re-flag
       if (mintMode() === 'server') {
-        recoverGenieSession(true);
+        recoverGenieSession(false); // gated: no-op unless the session marker expired
       } else {
         setGenieMayNeedReconnect(true);
       }
